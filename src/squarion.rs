@@ -426,6 +426,10 @@ impl VertexVoxel {
     pub fn new(position: [u8; 3]) -> VertexVoxel {
         VertexVoxel { flags: 0, position }
     }
+
+    pub fn position(&self) -> [u8; 3] {
+        self.position
+    }
 }
 
 fn range_intersection(a: &Range<usize>, b: &Range<usize>) -> Range<usize> {
@@ -657,8 +661,20 @@ impl VertexGrid {
             .for_each_index_range(subrange, |r| self.sparse_materials.insert(r, material))
     }
 
+    pub fn range(&self) -> RangeZYX {
+        self.range
+    }
+
     pub fn set_voxel(&mut self, point: &Point<i32>, voxel: VertexVoxel) {
         self.set_voxels(&RangeZYX::single(*point), voxel)
+    }
+
+    pub fn get_voxel(&self, point: &Point<i32>) -> Option<VertexVoxel> {
+        if self.range.intersection(&RangeZYX::single(*point)).volume() == 0 {
+            return None;
+        }
+        let index = self.range.index_from_position(*point);
+        self.sparse_vertices.get(&index).copied()
     }
 
     pub fn set_voxels(&mut self, subrange: &RangeZYX, voxel: VertexVoxel) {

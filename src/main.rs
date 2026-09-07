@@ -57,6 +57,10 @@ enum Commands {
         #[arg(short, long, default_value_t = 1971262921)]
         material: u64,
 
+        /// Laplacian smoothing iterations after vertex snap (0 = off)
+        #[arg(long, default_value_t = 0)]
+        smooth: u32,
+
         #[command(flatten)]
         scale: ScaleInfo,
     },
@@ -81,6 +85,7 @@ fn main() {
             size,
             r#type,
             material,
+            smooth,
             scale,
         } => {
             let (models, _) = tobj::load_obj(
@@ -138,7 +143,7 @@ fn main() {
             };
 
             let voxelizer = Voxelizer::new(isometry, mesh);
-            let svo = voxelizer.create_lods(&svo_aabb, Point::origin(), height, material);
+            let svo = voxelizer.create_lods(&svo_aabb, Point::origin(), height, material, smooth);
             let bp = Blueprint::new(
                 input
                     .clone()

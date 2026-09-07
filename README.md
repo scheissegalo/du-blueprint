@@ -9,7 +9,10 @@ blueprint file. Expect an 8x bigger number for each size above that.
 Quick start:
 ```
 du-blueprint generate --auto --type=dynamic --size=l my_model.obj my_blueprint.blueprint
+du-blueprint generate --auto --type=dynamic --size=s --smooth 3 my_model.obj my_blueprint.blueprint
 ```
+
+`--smooth N` runs N Laplacian passes on voxel corner positions after snapping (0 = off). Higher values fill snap holes more but round edges more.
 
 The only supported format at the moment is `.obj`. For good results, use a manifold mesh.
 For best results, take into account in game voxel limitations when making your model.

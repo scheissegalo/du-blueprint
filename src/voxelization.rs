@@ -211,6 +211,71 @@ fn extract_vertices(
     result
 }
 
+const SMOOTH_LAMBDA: f64 = 0.5;
+const SMOOTH_NEIGHBORS: [Vector<i32>; 6] = [
+    Vector::new(1, 0, 0),
+    Vector::new(-1, 0, 0),
+    Vector::new(0, 1, 0),
+    Vector::new(0, -1, 0),
+    Vector::new(0, 0, 1),
+    Vector::new(0, 0, -1),
+];
+
+// Laplacian-smooth encoded corner positions. Interior 126-corners stay put because
+// their neighbors are also 126; snapped/boundary corners blend toward neighbors,
+// which fills vertex-snap dimples and slightly rounds edges.
+fn smooth_vertex_grid(grid: &mut VertexGrid, iterations: u32) {
+    if iterations == 0 {
+        return;
+    }
+
+    let range = grid.range();
+    let mut positions = HashMap::new();
+    for x in 0..range.size.x {
+        for y in 0..range.size.y {
+            for z in 0..range.size.z {
+                let point = range.origin + Vector::new(x, y, z);
+                if let Some(voxel) = grid.get_voxel(&point) {
+                    positions.insert(point, voxel.position());
+                }
+            }
+        }
+    }
+
+    for _ in 0..iterations {
+        let mut next = HashMap::with_capacity(positions.len());
+        for (point, pos) in &positions {
+            let mut sum = [0.0f64; 3];
+            let mut count = 0u32;
+            for offset in &SMOOTH_NEIGHBORS {
+                if let Some(neighbor) = positions.get(&(point + *offset)) {
+                    for i in 0..3 {
+                        sum[i] += neighbor[i] as f64;
+                    }
+                    count += 1;
+                }
+            }
+            let new_pos = if count == 0 {
+                *pos
+            } else {
+                let mut blended = [0u8; 3];
+                for i in 0..3 {
+                    let avg = sum[i] / count as f64;
+                    let value = (1.0 - SMOOTH_LAMBDA) * pos[i] as f64 + SMOOTH_LAMBDA * avg;
+                    blended[i] = value.round().clamp(0.0, 252.0) as u8;
+                }
+                blended
+            };
+            next.insert(*point, new_pos);
+        }
+        positions = next;
+    }
+
+    for (point, pos) in positions {
+        grid.set_voxel(&point, VertexVoxel::new(pos));
+    }
+}
+
 // This is by far the most expensive part, mostly due to Trimesh being kinda slow and the algorithm itself
 // being pretty naive. For now we just throw threads at it, but it can definitely be improved.
 fn voxelize_chunk(
@@ -220,6 +285,7 @@ fn voxelize_chunk(
     voxel_origin: &Point<i32>,
     material: u64,
     is_lod: bool,
+    smooth: u32,
 ) -> Option<VoxelCellData> {
     // We have to over-voxelize that chunk due to the boundries expected in voxel cell data.
     // e.g. for an inner_range of [0, 0, 0] -> [32, 32, 32] the actual range of the chunk is
@@ -285,6 +351,7 @@ fn voxelize_chunk(
     for (point, offset) in vertices {
         grid.set_voxel(&point, VertexVoxel::new([offset.x, offset.y, offset.z]));
     }
+    smooth_vertex_grid(&mut grid, smooth);
 
     let mut mapping = MaterialMapper::default();
 
@@ -327,6 +394,7 @@ impl Voxelizer {
         origin: Point<i32>,
         height: usize,
         material: u64,
+        smooth: u32,
     ) -> Svo<Option<VoxelCellData>> {
         let extent = 1 << height;
         let chunk_size = aabb.extents().x / extent as f64;
@@ -351,6 +419,7 @@ impl Voxelizer {
                         &voxel_origin,
                         material,
                         is_lod,
+                        smooth,
                     )
                 });
                 if range.size.x == 1 {
