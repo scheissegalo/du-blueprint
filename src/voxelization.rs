@@ -1,5 +1,5 @@
 use async_std::task::{self, block_on};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -108,6 +108,21 @@ fn to_voxel_offset(offset: Vector<f64>) -> Vector<u8> {
     offset.map(|v| (126.0 + v).clamp(0.0, 252.0) as u8)
 }
 
+fn to_full_offset(offset: Vector<f64>) -> Vector<u8> {
+    offset.map(|v| (126.0 + v.round()).clamp(0.0, 252.0) as u8)
+}
+
+// Closest point on the OBJ, clamped to this corner's cell.
+fn closest_surface_offset(
+    isometry: &Isometry<f64>,
+    mesh: &TriMesh,
+    corner: Point<f64>,
+    voxel_size: f64,
+) -> Vector<u8> {
+    let projected = mesh.project_point(isometry, &corner, false).point;
+    to_full_offset((projected - corner) * 84.0 / voxel_size)
+}
+
 // Tries to snap to the nearest vertex, then edge, then face.
 //
 // Results in some artifacts in game where too many voxels snap to a vertex/edge and as a result
@@ -164,12 +179,269 @@ fn calculate_vertex_offset(
     }
 }
 
+fn grid_corner_world(
+    aabb: &Aabb,
+    origin: Point<i32>,
+    voxel_size: f64,
+    point: Point<i32>,
+) -> Point<f64> {
+    aabb.mins + voxel_size * (point - origin).map(|v| v as f64)
+}
+
+fn mesh_normal(
+    isometry: &Isometry<f64>,
+    mesh: &TriMesh,
+    point: Point<f64>,
+) -> Option<Vector<f64>> {
+    let (_, feature) = mesh.project_point_and_get_feature(isometry, &point);
+    mesh.triangle(feature.unwrap_face())
+        .transformed(isometry)
+        .normal()
+        .map(|n| *n)
+}
+
+fn collect_solid_cells(voxels: &Svo<Voxel>) -> HashSet<Point<i32>> {
+    let mut solid = HashSet::new();
+    voxels.cata(|range, v, cs| {
+        if cs.is_some() {
+            return;
+        }
+        if matches!(v, Voxel::Internal | Voxel::Boundry(true)) {
+            solid.insert(range.origin);
+        }
+    });
+    solid
+}
+
+const FILL_NEIGHBORS: [[i32; 3]; 6] = [
+    [1, 0, 0],
+    [-1, 0, 0],
+    [0, 1, 0],
+    [0, -1, 0],
+    [0, 0, 1],
+    [0, 0, -1],
+];
+
+// Face fills sit on one OBJ plane and can be flattened onto it. Edge/corner
+// fills see two surfaces; those leftover corners are snapped to neighbors.
+fn is_face_fill(
+    cell: Point<i32>,
+    solid: &HashSet<Point<i32>>,
+    isometry: &Isometry<f64>,
+    mesh: &TriMesh,
+    aabb: &Aabb,
+    origin: Point<i32>,
+    voxel_size: f64,
+) -> bool {
+    let mut toward_solid: Option<Vector<f64>> = None;
+    let mut solid_neighbors = 0u32;
+    for n in &FILL_NEIGHBORS {
+        let neighbor = cell + Vector::new(n[0], n[1], n[2]);
+        if solid.contains(&neighbor) {
+            solid_neighbors += 1;
+            toward_solid = Some(Vector::new(n[0] as f64, n[1] as f64, n[2] as f64));
+        }
+    }
+    if solid_neighbors != 1 {
+        return false;
+    }
+
+    let center = aabb.mins + voxel_size * (cell - origin).map(|v| v as f64 + 0.5);
+    let Some(n0) = mesh_normal(isometry, mesh, center) else {
+        return false;
+    };
+    if n0.dot(&toward_solid.unwrap()) < 0.3 {
+        return false;
+    }
+    for offset in &RangeZYX::OFFSETS {
+        let corner = grid_corner_world(
+            aabb,
+            origin,
+            voxel_size,
+            cell + Vector::from_row_slice(offset),
+        );
+        let Some(n) = mesh_normal(isometry, mesh, corner) else {
+            continue;
+        };
+        if n0.dot(&n) < 0.5 {
+            return false;
+        }
+    }
+    true
+}
+
+fn encoded_world(
+    aabb: &Aabb,
+    origin: Point<i32>,
+    voxel_size: f64,
+    point: Point<i32>,
+    encoded: Point<u8>,
+) -> Point<f64> {
+    let corner = grid_corner_world(aabb, origin, voxel_size, point);
+    corner + encoded.coords.map(|c| (c as f64 - 126.0) / 84.0 * voxel_size)
+}
+
+fn encode_from_rest(
+    aabb: &Aabb,
+    origin: Point<i32>,
+    voxel_size: f64,
+    point: Point<i32>,
+    world: Point<f64>,
+) -> Point<u8> {
+    let rest = grid_corner_world(aabb, origin, voxel_size, point);
+    Point::origin() + to_full_offset((world - rest) * 84.0 / voxel_size)
+}
+
+fn neighbor_average(
+    result: &HashMap<Point<i32>, Point<u8>>,
+    aabb: &Aabb,
+    origin: Point<i32>,
+    voxel_size: f64,
+    point: Point<i32>,
+) -> Option<Point<f64>> {
+    let mut sum = Vector::zeros();
+    let mut count = 0u32;
+    for n in &FILL_NEIGHBORS {
+        let neighbor = point + Vector::new(n[0], n[1], n[2]);
+        if let Some(enc) = result.get(&neighbor) {
+            sum += encoded_world(aabb, origin, voxel_size, neighbor, *enc).coords;
+            count += 1;
+        }
+    }
+    if count >= 2 {
+        Some(Point::origin() + sum / count as f64)
+    } else {
+        None
+    }
+}
+
+fn snap_unset_to_neighbors(
+    voxels: &Svo<Voxel>,
+    result: &mut HashMap<Point<i32>, Point<u8>>,
+    isometry: &Isometry<f64>,
+    mesh: &TriMesh,
+    aabb: &Aabb,
+    origin: Point<i32>,
+    voxel_size: f64,
+) {
+    let mut unset = HashSet::new();
+    voxels.cata(|range, v, cs| {
+        if cs.is_some() {
+            return;
+        }
+        let Voxel::Boundry(false) = v else {
+            return;
+        };
+        for offset in &RangeZYX::OFFSETS {
+            let point = range.origin + Vector::from_row_slice(offset);
+            if !result.contains_key(&point) {
+                unset.insert(point);
+            }
+        }
+    });
+
+    loop {
+        let mut placed = Vec::new();
+        for point in &unset {
+            if let Some(target) = neighbor_average(result, aabb, origin, voxel_size, *point) {
+                result.insert(
+                    *point,
+                    encode_from_rest(aabb, origin, voxel_size, *point, target),
+                );
+                placed.push(*point);
+            }
+        }
+        if placed.is_empty() {
+            break;
+        }
+        for point in placed {
+            unset.remove(&point);
+        }
+    }
+
+    for point in unset {
+        let rest = grid_corner_world(aabb, origin, voxel_size, point);
+        let target = mesh.project_point(isometry, &rest, false).point;
+        result.insert(
+            point,
+            encode_from_rest(aabb, origin, voxel_size, point, target),
+        );
+    }
+}
+
+fn relax_surface_vertices(
+    vertices: &mut HashMap<Point<i32>, Point<u8>>,
+    isometry: &Isometry<f64>,
+    mesh: &TriMesh,
+    aabb: &Aabb,
+    origin: Point<i32>,
+    voxel_size: f64,
+    iterations: u32,
+) {
+    for _ in 0..iterations {
+        let previous = vertices.clone();
+        for (point, encoded) in previous.iter() {
+            let self_pos = encoded_world(aabb, origin, voxel_size, *point, *encoded);
+            let mut sum = Vector::zeros();
+            let mut count = 0u32;
+            for n in &FILL_NEIGHBORS {
+                let neighbor = *point + Vector::new(n[0], n[1], n[2]);
+                if let Some(enc) = previous.get(&neighbor) {
+                    sum += encoded_world(aabb, origin, voxel_size, neighbor, *enc).coords;
+                    count += 1;
+                }
+            }
+            if count == 0 {
+                continue;
+            }
+            let blended = self_pos + ((sum / count as f64) - self_pos.coords) * 0.5;
+            let projected = mesh.project_point(isometry, &blended, false).point;
+            vertices.insert(
+                *point,
+                encode_from_rest(aabb, origin, voxel_size, *point, projected),
+            );
+        }
+    }
+}
+
+fn flatten_fill_cell(
+    range: &RangeZYX,
+    result: &mut HashMap<Point<i32>, Point<u8>>,
+    isometry: &Isometry<f64>,
+    mesh: &TriMesh,
+    aabb: &Aabb,
+    origin: Point<i32>,
+    voxel_size: f64,
+) {
+    let center = aabb.mins + voxel_size * (range.origin - origin).map(|v| v as f64 + 0.5);
+    let (proj, feature) = mesh.project_point_and_get_feature(isometry, &center);
+    let tri = mesh.triangle(feature.unwrap_face()).transformed(isometry);
+    let Some(normal) = tri.normal() else {
+        return;
+    };
+    let nrm = *normal;
+    let plane_p = proj.point;
+    for offset in &RangeZYX::OFFSETS {
+        let point = range.origin + Vector::from_row_slice(offset);
+        if result.contains_key(&point) {
+            continue;
+        }
+        let rest = grid_corner_world(aabb, origin, voxel_size, point);
+        let projected = rest - nrm * nrm.dot(&(rest.coords - plane_p.coords));
+        result.insert(
+            point,
+            Point::origin() + to_full_offset((projected - rest) * 84.0 / voxel_size),
+        );
+    }
+}
+
 fn extract_vertices(
     voxels: &Svo<Voxel>,
     isometry: &Isometry<f64>,
     mesh: &TriMesh,
     aabb: &Aabb,
     origin: Point<i32>,
+    smooth: u32,
 ) -> HashMap<Point<i32>, Point<u8>> {
     let voxel_size = aabb.extents().x / voxels.range.size.x as f64;
     let mut significant_points = HashMap::new();
@@ -201,79 +473,62 @@ fn extract_vertices(
 
     let mut result = HashMap::new();
     for (point, anchors) in significant_points {
-        let anchor = anchors.iter().fold(Point::origin(), |a, v| a + v) / anchors.len() as f64;
-        let pos = aabb.mins + voxel_size * (point - origin).map(|v| v as f64);
-        let aabb = Aabb::from_half_extents(pos, Vector::repeat(voxel_size * 1.5));
-
-        let best = calculate_vertex_offset(isometry, mesh, &aabb, anchor, voxel_size);
+        let pos = grid_corner_world(aabb, origin, voxel_size, point);
+        let best = if smooth >= 1 {
+            closest_surface_offset(isometry, mesh, pos, voxel_size)
+        } else {
+            let anchor =
+                anchors.iter().fold(Point::origin(), |a, v| a + v) / anchors.len() as f64;
+            let aabb = Aabb::from_half_extents(pos, Vector::repeat(voxel_size * 1.5));
+            calculate_vertex_offset(isometry, mesh, &aabb, anchor, voxel_size)
+        };
         result.insert(point, Point::origin() + best);
     }
-    result
-}
 
-const SMOOTH_LAMBDA: f64 = 0.5;
-const SMOOTH_NEIGHBORS: [Vector<i32>; 6] = [
-    Vector::new(1, 0, 0),
-    Vector::new(-1, 0, 0),
-    Vector::new(0, 1, 0),
-    Vector::new(0, -1, 0),
-    Vector::new(0, 0, 1),
-    Vector::new(0, 0, -1),
-];
-
-// Laplacian-smooth encoded corner positions. Interior 126-corners stay put because
-// their neighbors are also 126; snapped/boundary corners blend toward neighbors,
-// which fills vertex-snap dimples and slightly rounds edges.
-fn smooth_vertex_grid(grid: &mut VertexGrid, iterations: u32) {
-    if iterations == 0 {
-        return;
-    }
-
-    let range = grid.range();
-    let mut positions = HashMap::new();
-    for x in 0..range.size.x {
-        for y in 0..range.size.y {
-            for z in 0..range.size.z {
-                let point = range.origin + Vector::new(x, y, z);
-                if let Some(voxel) = grid.get_voxel(&point) {
-                    positions.insert(point, voxel.position());
-                }
+    if smooth >= 1 {
+        let solid = collect_solid_cells(voxels);
+        voxels.cata(|range, v, cs| {
+            if cs.is_some() {
+                return;
             }
-        }
-    }
-
-    for _ in 0..iterations {
-        let mut next = HashMap::with_capacity(positions.len());
-        for (point, pos) in &positions {
-            let mut sum = [0.0f64; 3];
-            let mut count = 0u32;
-            for offset in &SMOOTH_NEIGHBORS {
-                if let Some(neighbor) = positions.get(&(point + *offset)) {
-                    for i in 0..3 {
-                        sum[i] += neighbor[i] as f64;
-                    }
-                    count += 1;
-                }
-            }
-            let new_pos = if count == 0 {
-                *pos
-            } else {
-                let mut blended = [0u8; 3];
-                for i in 0..3 {
-                    let avg = sum[i] / count as f64;
-                    let value = (1.0 - SMOOTH_LAMBDA) * pos[i] as f64 + SMOOTH_LAMBDA * avg;
-                    blended[i] = value.round().clamp(0.0, 252.0) as u8;
-                }
-                blended
+            let Voxel::Boundry(false) = v else {
+                return;
             };
-            next.insert(*point, new_pos);
+            if !is_face_fill(
+                range.origin,
+                &solid,
+                isometry,
+                mesh,
+                aabb,
+                origin,
+                voxel_size,
+            ) {
+                return;
+            }
+            flatten_fill_cell(&range, &mut result, isometry, mesh, aabb, origin, voxel_size);
+        });
+        snap_unset_to_neighbors(
+            voxels,
+            &mut result,
+            isometry,
+            mesh,
+            aabb,
+            origin,
+            voxel_size,
+        );
+        if smooth >= 2 {
+            relax_surface_vertices(
+                &mut result,
+                isometry,
+                mesh,
+                aabb,
+                origin,
+                voxel_size,
+                smooth - 1,
+            );
         }
-        positions = next;
     }
-
-    for (point, pos) in positions {
-        grid.set_voxel(&point, VertexVoxel::new(pos));
-    }
+    result
 }
 
 // This is by far the most expensive part, mostly due to Trimesh being kinda slow and the algorithm itself
@@ -316,7 +571,7 @@ fn voxelize_chunk(
         let (place_materials, place_positions) = match value {
             Voxel::External => (false, false),
             Voxel::Internal => (true, true),
-            Voxel::Boundry(significant) => (*significant, true),
+            Voxel::Boundry(significant) => (smooth >= 1 || *significant, true),
         };
         if place_materials {
             // Materials are placed on the +[1, 1, 1] vertex.
@@ -347,11 +602,11 @@ fn voxelize_chunk(
         mesh,
         &svo_aabb,
         voxel_origin - Vector::repeat(2),
+        smooth,
     );
     for (point, offset) in vertices {
         grid.set_voxel(&point, VertexVoxel::new([offset.x, offset.y, offset.z]));
     }
-    smooth_vertex_grid(&mut grid, smooth);
 
     let mut mapping = MaterialMapper::default();
 

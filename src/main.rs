@@ -57,7 +57,7 @@ enum Commands {
         #[arg(short, long, default_value_t = 1971262921)]
         material: u64,
 
-        /// Laplacian smoothing iterations after vertex snap (0 = off)
+        /// 0 = original snap. 1 = fill dimples, flatten faces, snap edges to neighbors. 2-5 = extra whole-mesh smoothing.
         #[arg(long, default_value_t = 0)]
         smooth: u32,
 

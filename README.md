@@ -9,10 +9,10 @@ blueprint file. Expect an 8x bigger number for each size above that.
 Quick start:
 ```
 du-blueprint generate --auto --type=dynamic --size=l my_model.obj my_blueprint.blueprint
-du-blueprint generate --auto --type=dynamic --size=s --smooth 3 my_model.obj my_blueprint.blueprint
+du-blueprint generate --auto --type=dynamic --size=s --smooth 1 my_model.obj my_blueprint.blueprint
 ```
 
-`--smooth N` runs N Laplacian passes on voxel corner positions after snapping (0 = off). Higher values fill snap holes more but round edges more.
+`--smooth 0` keeps the original vertex/edge/face snap. `--smooth 1` fills every outer intersecting voxel, flattens cells on smooth faces onto the OBJ hull, and snaps leftover fill corners to neighboring placed vertices so edges follow the generated surface instead of staying as cubes. `--smooth 2` through `--smooth 5` add extra whole-mesh relax passes on top of that.
 
 The only supported format at the moment is `.obj`. For good results, use a manifold mesh.
 For best results, take into account in game voxel limitations when making your model.
